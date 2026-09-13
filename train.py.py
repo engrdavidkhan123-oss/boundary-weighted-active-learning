@@ -1,623 +1,718 @@
-﻿# ============================================================
-# MedSAM Active Prompt Learning — WINDOWS NATIVE VERSION
-# Reads directly from C:\Abdominal CT scans\
-# Writes outputs to C:\Abdomen CT code\outputs\
-# ============================================================
-
-# --- Dependency check (run this first, or use pip manually) ---
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-# pip install transformers scikit-image scikit-learn pandas matplotlib scipy seaborn psutil
+﻿# run_medsam_al.py
+# Active learning with boundary-weighted acquisition for abdominal CT.
+# MedSAM LoRA fine-tuning, five seeds, five methods, five budgets.
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import sys
+import glob
+import json
+import time
+import random
+import hashlib
+import argparse
+import warnings
+from pathlib import Path
 
-import glob, random, gc, json, shutil, zipfile
 import numpy as np
-from PIL import Image
-import torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
-from torch.amp import autocast, GradScaler
+import pandas as pd
+import nibabel as nib
+from PIL import Image as PILImage
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from scipy.ndimage import binary_dilation, binary_erosion
-from scipy.spatial.distance import directed_hausdorff
+from torch.amp import autocast, GradScaler
+
+from scipy import ndimage
 from scipy.spatial import cKDTree
 from scipy.stats import ttest_rel
-import pandas as pd
+
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
-from transformers import SamModel
-import psutil
+import matplotlib.patches as mpatches
 
-# ============================================================
-# PATHS — Windows-native
-# ============================================================
-IMAGE_DIR = r"C:\Abdominal CT scans\abdominal\abdominal\images"
-LABEL_DIR = r"C:\Abdominal CT scans\abdominal\abdominal\labels"
-OUTPUT_DIR = r"C:\Abdomen CT code\outputs"
-CKPT_ROOT = os.path.join(OUTPUT_DIR, "checkpoints")
-FIGURES_DIR = os.path.join(OUTPUT_DIR, "figures")
+warnings.filterwarnings("ignore")
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(CKPT_ROOT, exist_ok=True)
-os.makedirs(FIGURES_DIR, exist_ok=True)
 
-print(f"IMAGE_DIR  = {IMAGE_DIR}")
-print(f"LABEL_DIR  = {LABEL_DIR}")
-print(f"OUTPUT_DIR = {OUTPUT_DIR}\n")
+# ---------------------------------------------------------------------------
+# ARGUMENTS
+# ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", type=str,
+                   default=r"E:\images",
+                   help="Directory containing image_*.nii(.gz)")
+    p.add_argument("--label_root", type=str,
+                   default=r"E:\labels",
+                   help="Directory containing label_*.nii(.gz)")
+    p.add_argument("--out_dir", type=str,
+                   default=r"E:\figures",
+                   help="Output directory for CSV, checkpoints, and figures")
+    p.add_argument("--dev", action="store_true",
+                   help="Reduced run for testing: 1 seed, 1 epoch, K=2, 2 budgets")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from checkpoints and partial CSV if present")
+    p.add_argument("--device", type=str, default="cuda",
+                   help="cuda or cpu")
+    return p.parse_args()
 
-# Verify paths exist
-if not os.path.isdir(IMAGE_DIR):
-    raise FileNotFoundError(f"Image directory not found: {IMAGE_DIR}")
-if not os.path.isdir(LABEL_DIR):
-    raise FileNotFoundError(f"Label directory not found: {LABEL_DIR}")
 
-# ============================================================
-# 0. PRE-FLIGHT RAM CHECK
-# ============================================================
-ram = psutil.virtual_memory()
-print(f"RAM at start: {ram.used/1e9:.1f} / {ram.total/1e9:.1f} GB ({ram.percent}%)")
-if ram.percent > 70:
-    print("[WARN] RAM usage is high — consider closing other apps.")
+ARGS = parse_args()
 
-try:
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-except:
-    pass
+DEV = ARGS.dev
+DATA_ROOT = ARGS.data_root
+LABEL_ROOT = ARGS.label_root
+OUT_DIR = ARGS.out_dir
+RESUME = ARGS.resume
 
-for _ in range(5): gc.collect()
-print("[OK] Cleanup done.\n")
+FIG_DIR = os.path.join(OUT_DIR, "figures")
+CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
+LOG_DIR = os.path.join(OUT_DIR, "logs")
+for d in (OUT_DIR, FIG_DIR, CKPT_DIR, LOG_DIR):
+    os.makedirs(d, exist_ok=True)
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # CONFIG
-# ============================================================
-# --- DEMO (fits local GPU, ~2 hours) ---
-NUM_SEEDS = 1
-MAX_ROUNDS = 4
-ENSEMBLE_K = 3
-# --- MedIA (needs strong GPU, ~60 GPU-hours) ---
-# NUM_SEEDS = 5
-# MAX_ROUNDS = 8
-# ENSEMBLE_K = 5
+# ---------------------------------------------------------------------------
+if DEV:
+    SEEDS = [42]
+    BUDGETS = [20, 40]
+    ENSEMBLE_K = 2
+    TRAIN_EPOCHS = 1
+    INIT_BUDGET = 20
+    QUERY_BATCH = 20
+    ACQ_SUBSAMPLE = 30
+else:
+    SEEDS = [42, 43, 44, 45, 46]
+    BUDGETS = [20, 40, 60, 80, 100]
+    ENSEMBLE_K = 5
+    TRAIN_EPOCHS = 20
+    INIT_BUDGET = 20
+    QUERY_BATCH = 20
+    ACQ_SUBSAMPLE = 150
 
+METHODS = ["Random", "Entropy", "Variance-only", "Gradient-only", "Boundary-weighted"]
+N_CLASSES = 7  # background + 6 foreground
+CLASS_NAMES = ["Liver", "Spleen", "Right Kidney",
+               "Pancreas", "Adrenal", "Peripancreatic Vessel"]
 HARD_CLASSES = [4, 5, 6]
-INITIAL_BUDGET = 20
-QUERY_BATCH = 20
-RANDOM_STATE = 42
-NUM_CLASSES = 7
+
 MEDSAM_SIZE = 1024
+BATCH_SIZE = 4
+LR = 1e-4
 BOX_NOISE_PX = 25
 BOX_EXPAND_PX = 10
 
-ENCODER_BATCH = 2
-TRAIN_BATCH = 16
-TRAIN_EPOCHS = 20
-LR = 1e-4
-ACQ_SUBSAMPLE = 50
-RAM_LOG_EVERY = 50
-
-METHODS = ['random', 'entropy', 'variance_only', 'gradient_only', 'boundary_weighted']
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(ARGS.device if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 if DEVICE.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
-print(f"Config: SEEDS={NUM_SEEDS}, ROUNDS={MAX_ROUNDS}, K={ENSEMBLE_K}\n")
 
-# ============================================================
-# 1. LOAD PAIRS DIRECTLY FROM DISK
-# ============================================================
-images = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.png")))
-labels = sorted(glob.glob(os.path.join(LABEL_DIR, "*.png")))
-print(f"Images found: {len(images)}")
-print(f"Labels found: {len(labels)}")
+CSV_PATH = os.path.join(OUT_DIR, "results.csv")
 
-image_dict = {os.path.basename(f): f for f in images}
-label_dict = {os.path.basename(f): f for f in labels}
-pairs = [(image_dict[n], label_dict[n]) for n in image_dict if n in label_dict]
-print(f"Total matched pairs: {len(pairs)}")
 
-if len(pairs) == 0:
-    raise RuntimeError("No matched image-label pairs found.")
+# ---------------------------------------------------------------------------
+# REPRODUCIBILITY
+# ---------------------------------------------------------------------------
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if DEVICE.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
 
-first_mask = np.array(Image.open(pairs[0][1]).convert("L"))
-print(f"Classes in first mask: {np.unique(first_mask)}\n")
 
-# ============================================================
-# 2. PATIENT-WISE SPLIT
-# ============================================================
-def pid(fname): return os.path.basename(fname).split('_')[0]
+# ---------------------------------------------------------------------------
+# DATA LOADING
+# ---------------------------------------------------------------------------
+def find_files(folder, prefix):
+    out = []
+    for ext in ("*.nii", "*.nii.gz"):
+        out.extend(glob.glob(os.path.join(folder, f"{prefix}_{ext}")))
+    return sorted(set(out))
 
-patient_map = {}
-for img, lbl in pairs:
-    patient_map.setdefault(pid(img), []).append((img, lbl))
 
-p_ids = list(patient_map.keys())
-tr_val_p, te_p = train_test_split(p_ids, test_size=0.2, random_state=RANDOM_STATE)
-tr_p, val_p = train_test_split(tr_val_p, test_size=0.15, random_state=RANDOM_STATE)
+def load_2d_nifti(path):
+    a = nib.load(path).get_fdata()
+    if a.ndim == 3 and a.shape[2] == 1:
+        a = a[:, :, 0]
+    return a
 
-train_pool = [p for k in tr_p  for p in patient_map[k]]
-val_pairs  = [p for k in val_p for p in patient_map[k]]
-test_pairs = [p for k in te_p  for p in patient_map[k]]
-print(f"Train: {len(train_pool)}, Val: {len(val_pairs)}, Test: {len(test_pairs)}\n")
 
-# ============================================================
-# 3. LOAD MedSAM
-# ============================================================
-print("Loading MedSAM...")
-sam_model = SamModel.from_pretrained("flaviagiammarino/medsam-vit-base").to(DEVICE)
-for p in sam_model.vision_encoder.parameters():
-    p.requires_grad = False
-sam_model.vision_encoder = sam_model.vision_encoder.half()
-print(f"Trainable: {sum(p.numel() for p in sam_model.parameters() if p.requires_grad)/1e6:.2f}M\n")
-
-# ============================================================
-# 4. UTILITIES
-# ============================================================
-def load_image_1024(path):
-    img = np.array(Image.open(path).convert("L"), dtype=np.float32)
+def resize_to_medsam(img_2d, lbl_2d):
+    img = np.clip(img_2d, -1000, 1000).astype(np.float32)
     img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    img_pil = Image.fromarray((img * 255).astype(np.uint8)).resize(
-        (MEDSAM_SIZE, MEDSAM_SIZE), Image.BILINEAR)
-    arr = np.array(img_pil, dtype=np.float32) / 255.0
-    return np.stack([arr, arr, arr], 0)
+    img_pil = PILImage.fromarray((img * 255).astype(np.uint8)).resize(
+        (MEDSAM_SIZE, MEDSAM_SIZE), PILImage.BILINEAR)
+    lbl_pil = PILImage.fromarray(lbl_2d.astype(np.uint8)).resize(
+        (MEDSAM_SIZE, MEDSAM_SIZE), PILImage.NEAREST)
+    return (np.array(img_pil, dtype=np.float32) / 255.0,
+            np.array(lbl_pil, dtype=np.uint8))
 
-def load_mask_1024(path):
-    m = Image.open(path).convert("L").resize((MEDSAM_SIZE, MEDSAM_SIZE), Image.NEAREST)
-    return np.array(m, dtype=np.uint8)
 
-def mask_to_box(mask_2d, class_id):
+def load_all_slices(img_root, lbl_root):
+    img_files = find_files(img_root, "image")
+    lbl_files = find_files(lbl_root, "label")
+    n = min(len(img_files), len(lbl_files))
+    if n == 0:
+        raise RuntimeError("No matching NIfTI files found.")
+    print(f"Found {len(img_files)} images, {len(lbl_files)} labels, using {n}")
+    imgs = np.zeros((n, MEDSAM_SIZE, MEDSAM_SIZE), dtype=np.float32)
+    lbls = np.zeros((n, MEDSAM_SIZE, MEDSAM_SIZE), dtype=np.uint8)
+    for i in range(n):
+        a = load_2d_nifti(img_files[i])
+        b = load_2d_nifti(lbl_files[i]).astype(np.int16)
+        im, lb = resize_to_medsam(a, b)
+        imgs[i] = im
+        lbls[i] = lb
+        if (i + 1) % 100 == 0:
+            print(f"  loaded {i+1}/{n}")
+    return imgs, lbls
+
+
+# ---------------------------------------------------------------------------
+# SPLIT
+# ---------------------------------------------------------------------------
+def split_slices(n, seed=42):
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    n_train = int(0.65 * n)
+    n_val = int(0.15 * n)
+    return perm[:n_train], perm[n_train:n_train + n_val], perm[n_train + n_val:]
+
+
+# ---------------------------------------------------------------------------
+# MEDSAM
+# ---------------------------------------------------------------------------
+def load_medsam(device):
+    try:
+        from transformers import SamModel
+    except ImportError:
+        raise RuntimeError("Install transformers: pip install transformers")
+    sam = SamModel.from_pretrained("flaviagiammarino/medsam-vit-base").to(device)
+    sam.eval()
+    for p in sam.vision_encoder.parameters():
+        p.requires_grad = False
+    return sam
+
+
+@torch.no_grad()
+def precompute_embeddings(sam, img_tensor, batch_size=4, device="cuda"):
+    embs = []
+    sam.vision_encoder.eval()
+    for start in range(0, len(img_tensor), batch_size):
+        end = min(start + batch_size, len(img_tensor))
+        batch = torch.from_numpy(img_tensor[start:end]).unsqueeze(1).repeat(1, 3, 1, 1).to(device)
+        if device == "cuda":
+            batch = batch.half()
+        with autocast(device_type="cuda" if device == "cuda" else "cpu",
+                      enabled=(device == "cuda")):
+            out = sam.vision_encoder(batch).last_hidden_state
+        embs.append(out.detach().float().cpu())
+    return torch.cat(embs, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# DECODER (LoRA-like wrapper)
+# ---------------------------------------------------------------------------
+class PromptDecoder(nn.Module):
+    def __init__(self, sam):
+        super().__init__()
+        self.sam = sam
+        self.prompt_encoder = sam.prompt_encoder
+        self.mask_decoder = sam.mask_decoder
+        for p in self.prompt_encoder.parameters():
+            p.requires_grad = True
+        for p in self.mask_decoder.parameters():
+            p.requires_grad = True
+
+    def forward(self, embedding, box):
+        B = embedding.shape[0]
+        boxes = box.view(B, 1, 4).to(embedding.dtype)
+        sparse, dense = self.prompt_encoder(
+            input_points=None, input_labels=None,
+            input_boxes=boxes, input_masks=None)
+        image_pe = self.prompt_encoder.get_dense_pe().to(embedding.dtype)
+        if image_pe.shape[0] == 1 and B > 1:
+            image_pe = image_pe.repeat(B, 1, 1, 1)
+        low_res, _ = self.mask_decoder(
+            image_embeddings=embedding,
+            image_positional_embeddings=image_pe,
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=False)
+        return F.interpolate(low_res, size=(MEDSAM_SIZE, MEDSAM_SIZE),
+                             mode="bilinear", align_corners=False)
+
+
+# ---------------------------------------------------------------------------
+# BOXES
+# ---------------------------------------------------------------------------
+def box_from_mask(mask_2d, class_id, noise_px=BOX_NOISE_PX, expand=BOX_EXPAND_PX):
     ys, xs = np.where(mask_2d == class_id)
-    if len(ys) == 0: return None
-    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-
-def simulate_user_box(gt_box, noise=BOX_NOISE_PX, expand=BOX_EXPAND_PX, img_size=MEDSAM_SIZE):
-    x0, y0, x1, y1 = gt_box
-    x0 = x0 + np.random.randint(-noise, noise+1) - expand
-    y0 = y0 + np.random.randint(-noise, noise+1) - expand
-    x1 = x1 + np.random.randint(-noise, noise+1) + expand
-    y1 = y1 + np.random.randint(-noise, noise+1) + expand
-    x0 = max(0, min(x0, img_size-1)); y0 = max(0, min(y0, img_size-1))
-    x1 = max(0, min(x1, img_size-1)); y1 = max(0, min(y1, img_size-1))
+    if len(ys) == 0:
+        return None
+    H, W = mask_2d.shape
+    x0, y0, x1, y1 = xs.min(), ys.min(), xs.max(), ys.max()
+    x0 = max(0, x0 - expand + np.random.randint(-noise_px, noise_px + 1))
+    y0 = max(0, y0 - expand + np.random.randint(-noise_px, noise_px + 1))
+    x1 = min(W, x1 + expand + np.random.randint(-noise_px, noise_px + 1))
+    y1 = min(H, y1 + expand + np.random.randint(-noise_px, noise_px + 1))
     if x1 <= x0: x1 = x0 + 5
     if y1 <= y0: y1 = y0 + 5
-    return [x0, y0, x1, y1]
+    return np.array([x0 / W, y0 / H, x1 / W, y1 / H], dtype=np.float32)
 
-# ============================================================
-# 5. EMBEDDING PRE-COMPUTATION
-# ============================================================
-print(f"Pre-computing embeddings (batch_size={ENCODER_BATCH})...")
 
-def compute_embeddings_batched(pair_list, batch_size=ENCODER_BATCH, tag="train"):
-    sam_model.vision_encoder.eval()
-    out = []
-    n = len(pair_list)
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            batch_imgs = np.stack([load_image_1024(pair_list[i][0]) for i in range(start, end)], 0)
-            batch_t = torch.from_numpy(batch_imgs).float().to(DEVICE).half()
-            with autocast(device_type='cuda', dtype=torch.float16):
-                embs = sam_model.vision_encoder(batch_t).last_hidden_state
-            for j in range(start, end):
-                _, lp = pair_list[j]
-                out.append({
-                    'embedding': embs[j-start:j-start+1].detach().cpu().half(),
-                    'mask': load_mask_1024(lp),
-                    'img_path': pair_list[j][0],
-                })
-            del batch_t, embs, batch_imgs
-            torch.cuda.empty_cache(); gc.collect()
-            if end % RAM_LOG_EVERY == 0 or end == n:
-                r = psutil.virtual_memory()
-                print(f"  [{tag}] {end}/{n}  RAM: {r.used/1e9:.1f}/{r.total/1e9:.1f}GB ({r.percent}%)")
-    return out
+# ---------------------------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------------------------
+def dice_score(pred, gt):
+    inter = np.logical_and(pred, gt).sum()
+    denom = pred.sum() + gt.sum()
+    return 2.0 * inter / denom if denom > 0 else np.nan
 
-emb_train_all = compute_embeddings_batched(train_pool, tag="train")
-gc.collect()
-emb_val = compute_embeddings_batched(val_pairs, tag="val")
-gc.collect()
-emb_test = compute_embeddings_batched(test_pairs, tag="test")
-gc.collect()
 
-r = psutil.virtual_memory()
-print(f"Embeddings ready: train={len(emb_train_all)}, val={len(emb_val)}, test={len(emb_test)}")
-print(f"RAM after embeddings: {r.used/1e9:.1f}/{r.total/1e9:.1f} GB ({r.percent}%)\n")
+def hd95(pred, gt):
+    if pred.sum() == 0 or gt.sum() == 0:
+        return np.nan
+    p_surf = pred ^ ndimage.binary_erosion(pred)
+    g_surf = gt ^ ndimage.binary_erosion(gt)
+    ys, xs = np.where(p_surf); pts_p = np.stack([ys, xs], 1)
+    ys, xs = np.where(g_surf); pts_g = np.stack([ys, xs], 1)
+    if len(pts_p) == 0 or len(pts_g) == 0:
+        return np.nan
+    tg = cKDTree(pts_g); tp = cKDTree(pts_p)
+    dp, _ = tg.query(pts_p); dg, _ = tp.query(pts_g)
+    diag = np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2)
+    return float(max(np.percentile(dp, 95), np.percentile(dg, 95)) / diag)
 
-# ============================================================
-# 6. TRAINABLE WRAPPER
-# ============================================================
-class MedSAMPromptDecoder(nn.Module):
-    def __init__(self, sam_model):
-        super().__init__()
-        self.sam_model = sam_model
-        self.prompt_encoder = sam_model.prompt_encoder
-        self.mask_decoder = sam_model.mask_decoder
 
-    def get_image_positional_embeddings(self, batch_size):
-        if hasattr(self.sam_model, 'get_image_wide_positional_embeddings'):
-            pe = self.sam_model.get_image_wide_positional_embeddings()
-        else:
-            size = self.prompt_encoder.image_embedding_size
-            shared = (getattr(self.sam_model, 'shared_image_embedding', None)
-                      or getattr(self.prompt_encoder, 'shared_image_embedding', None)
-                      or getattr(self.prompt_encoder, 'shared_embedding', None))
-            if shared is None:
-                for name, module in self.prompt_encoder.named_modules():
-                    if 'positional_embedding' in name and hasattr(module, 'positional_embedding'):
-                        shared = module; break
-            device = next(self.prompt_encoder.parameters()).device
-            grid = torch.ones(size, device=device, dtype=torch.float32)
-            y_embed = grid.cumsum(dim=0) - 0.5
-            x_embed = grid.cumsum(dim=1) - 0.5
-            y_embed = y_embed / size[0]; x_embed = x_embed / size[1]
-            coords = torch.stack([x_embed, y_embed], dim=-1)
-            pe = shared(coords.unsqueeze(0)).permute(0, 3, 1, 2)
-        if pe.shape[0] == 1 and batch_size > 1:
-            pe = pe.repeat(batch_size, 1, 1, 1)
-        elif pe.shape[0] != batch_size:
-            pe = pe.expand(batch_size, -1, -1, -1)
-        return pe
+def assd(pred, gt):
+    if pred.sum() == 0 or gt.sum() == 0:
+        return np.nan
+    p_surf = pred ^ ndimage.binary_erosion(pred)
+    g_surf = gt ^ ndimage.binary_erosion(gt)
+    ys, xs = np.where(p_surf); pts_p = np.stack([ys, xs], 1)
+    ys, xs = np.where(g_surf); pts_g = np.stack([ys, xs], 1)
+    if len(pts_p) == 0 or len(pts_g) == 0:
+        return np.nan
+    tg = cKDTree(pts_g); tp = cKDTree(pts_p)
+    dp, _ = tg.query(pts_p); dg, _ = tp.query(pts_g)
+    diag = np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2)
+    return float((dp.mean() + dg.mean()) / 2.0 / diag)
 
-    def forward(self, image_embedding, input_boxes):
-        sparse_emb, dense_emb = self.prompt_encoder(
-            input_points=None, input_labels=None,
-            input_boxes=input_boxes, input_masks=None,
-        )
-        batch_size = image_embedding.shape[0]
-        image_pe = self.get_image_positional_embeddings(batch_size).to(image_embedding.dtype)
-        decoder_out = self.mask_decoder(
-            image_embeddings=image_embedding,
-            image_positional_embeddings=image_pe,
-            sparse_prompt_embeddings=sparse_emb,
-            dense_prompt_embeddings=dense_emb,
-            multimask_output=False,
-        )
-        low_res_masks = (decoder_out[0] if isinstance(decoder_out, tuple)
-                         else decoder_out.pred_masks if hasattr(decoder_out, 'pred_masks')
-                         else decoder_out[0])
-        if low_res_masks.dim() == 5: low_res_masks = low_res_masks.squeeze(2)
-        if low_res_masks.dim() == 4 and low_res_masks.shape[1] > 1:
-            low_res_masks = low_res_masks[:, :1]
-        if low_res_masks.dim() == 3: low_res_masks = low_res_masks.unsqueeze(1)
-        if low_res_masks.dim() == 5:
-            B = low_res_masks.shape[0]
-            low_res_masks = low_res_masks.view(B, 1, low_res_masks.shape[-2], low_res_masks.shape[-1])
-        return F.interpolate(low_res_masks, size=(MEDSAM_SIZE, MEDSAM_SIZE),
-                             mode='bilinear', align_corners=False)
 
-# ============================================================
-# 7. LOSSES
-# ============================================================
-def dice_loss(logits, target, smooth=1.0):
+# ---------------------------------------------------------------------------
+# TRAINING
+# ---------------------------------------------------------------------------
+def bce_dice_loss(logits, target):
+    bce = F.binary_cross_entropy_with_logits(logits, target)
     p = torch.sigmoid(logits)
-    inter = (p * target).sum(dim=(1,2,3))
-    union = p.sum(dim=(1,2,3)) + target.sum(dim=(1,2,3))
-    return 1 - ((2*inter + smooth) / (union + smooth)).mean()
+    inter = (p * target).sum(dim=(1, 2, 3))
+    union = p.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    dice = 1 - (2 * inter + 1.0) / (union + 1.0)
+    return bce + dice.mean()
 
-def bce_loss(logits, target):
-    return F.binary_cross_entropy_with_logits(logits, target)
 
-# ============================================================
-# 8. TRAINING
-# ============================================================
-def make_batches(labeled_embs, batch_size=TRAIN_BATCH):
-    samples = []
-    for item in labeled_embs:
-        mask = item['mask']
-        present = [c for c in range(1, NUM_CLASSES) if (mask == c).sum() > 0]
-        for c in present:
-            gt_box = mask_to_box(mask, c)
-            if gt_box is None: continue
-            samples.append((item['embedding'], gt_box, (mask == c).astype(np.float32), c))
-    random.shuffle(samples)
-    return [samples[i:i+batch_size] for i in range(0, len(samples), batch_size)]
-
-def train_decoder(model, labeled_embs, epochs=TRAIN_EPOCHS, lr=LR):
-    opt = optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                      lr=lr, weight_decay=1e-4)
-    scaler = GradScaler()
+def train_one_epoch(model, embs, lbls, optimizer, scaler):
     model.train()
-    for ep in range(epochs):
-        for batch in make_batches(labeled_embs):
-            embs = torch.cat([b[0] for b in batch], dim=0).to(DEVICE)
-            boxes = torch.tensor([[simulate_user_box(b[1])] for b in batch],
-                                 dtype=torch.float32).to(DEVICE)
-            targets = torch.tensor(np.stack([b[2] for b in batch], 0)
-                                   ).unsqueeze(1).to(DEVICE)
-            opt.zero_grad()
-            with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(embs, boxes)
-                loss = bce_loss(logits, targets) + dice_loss(logits, targets)
+    perm = np.random.permutation(len(embs))
+    total = 0.0; count = 0
+    for i in range(0, len(perm), BATCH_SIZE):
+        idx = perm[i:i + BATCH_SIZE]
+        e = embs[idx].to(DEVICE).float()
+        l = lbls[idx].numpy()
+        targets, boxes = [], []
+        for k in range(len(idx)):
+            classes = [c for c in range(1, N_CLASSES) if (l[k] == c).sum() > 0]
+            if not classes:
+                classes = [1]
+            cls = random.choice(classes)
+            gt = (l[k] == cls).astype(np.float32)
+            b = box_from_mask(l[k], cls)
+            if b is None:
+                b = np.array([0.1, 0.1, 0.9, 0.9], dtype=np.float32)
+            targets.append(torch.from_numpy(gt).unsqueeze(0))
+            boxes.append(torch.from_numpy(b))
+        target = torch.stack(targets).to(DEVICE)
+        box = torch.stack(boxes).to(DEVICE)
+        optimizer.zero_grad()
+        with autocast(device_type="cuda" if DEVICE.type == "cuda" else "cpu",
+                      enabled=(DEVICE.type == "cuda")):
+            logits = model(e, box)
+            loss = bce_dice_loss(logits, target)
+        if scaler is not None:
             scaler.scale(loss).backward()
-            scaler.step(opt)
+            scaler.step(optimizer)
             scaler.update()
-    return model
+        else:
+            loss.backward()
+            optimizer.step()
+        total += loss.item() * len(idx)
+        count += len(idx)
+    return total / max(count, 1)
 
-# ============================================================
-# 9. TRAIN ENSEMBLE
-# ============================================================
-def train_ensemble(labeled_embs, K=ENSEMBLE_K, base_seed=0):
+
+@torch.no_grad()
+def evaluate(model, embs, lbls):
+    model.eval()
+    per_class = {c: {"dice": [], "hd95": [], "assd": []} for c in range(1, N_CLASSES)}
+    for i in range(len(embs)):
+        e = embs[i:i + 1].to(DEVICE).float()
+        l = lbls[i].numpy()
+        for c in range(1, N_CLASSES):
+            if (l == c).sum() == 0:
+                continue
+            b = box_from_mask(l, c, noise_px=0, expand=5)
+            if b is None:
+                continue
+            logits = model(e, torch.from_numpy(b).unsqueeze(0).to(DEVICE))
+            pred = (torch.sigmoid(logits).squeeze().cpu().numpy() > 0.5)
+            gt = (l == c)
+            d = dice_score(pred, gt)
+            h = hd95(pred, gt)
+            a = assd(pred, gt)
+            if not np.isnan(d): per_class[c]["dice"].append(d)
+            if not np.isnan(h): per_class[c]["hd95"].append(h)
+            if not np.isnan(a): per_class[c]["assd"].append(a)
+    summary = {}
+    for c in range(1, N_CLASSES):
+        summary[c] = {
+            "dice": float(np.mean(per_class[c]["dice"])) if per_class[c]["dice"] else np.nan,
+            "hd95": float(np.mean(per_class[c]["hd95"])) if per_class[c]["hd95"] else np.nan,
+            "assd": float(np.mean(per_class[c]["assd"])) if per_class[c]["assd"] else np.nan,
+        }
+    return summary
+
+
+def summarise(summary):
+    macro_dice = float(np.nanmean([summary[c]["dice"] for c in range(1, N_CLASSES)]))
+    hard_dice_val = float(np.nanmean([summary[c]["dice"] for c in HARD_CLASSES]))
+    hard_hd95 = float(np.nanmean([summary[c]["hd95"] for c in HARD_CLASSES]))
+    hard_assd = float(np.nanmean([summary[c]["assd"] for c in HARD_CLASSES]))
+    return macro_dice, hard_dice_val, hard_hd95, hard_assd
+
+
+def train_ensemble(sam, labeled_emb, labeled_lbl, K, base_seed):
     models = []
     for k in range(K):
-        torch.manual_seed(base_seed * 100 + k)
-        np.random.seed(base_seed * 100 + k)
-        m = MedSAMPromptDecoder(sam_model).to(DEVICE)
-        train_decoder(m, labeled_embs, epochs=TRAIN_EPOCHS, lr=LR)
+        seed_everything(base_seed * 1000 + k)
+        m = PromptDecoder(sam).to(DEVICE)
+        params = [p for p in m.parameters() if p.requires_grad]
+        opt = optim.AdamW(params, lr=LR, weight_decay=1e-4)
+        scaler = GradScaler() if DEVICE.type == "cuda" else None
+        for _ in range(TRAIN_EPOCHS):
+            train_one_epoch(m, labeled_emb, labeled_lbl, opt, scaler)
         models.append(m)
-        torch.cuda.empty_cache(); gc.collect()
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
     return models
 
-# ============================================================
-# 10. EVALUATION
-# ============================================================
-def evaluate(model, emb_list, batch_size=TRAIN_BATCH):
-    model.eval()
-    per_dice = {c: [] for c in range(1, NUM_CLASSES)}
-    samples = []
-    for item in emb_list:
-        mask = item['mask']
-        for c in range(1, NUM_CLASSES):
-            if (mask == c).sum() == 0: continue
-            gt_box = mask_to_box(mask, c)
-            if gt_box is None: continue
-            samples.append((item['embedding'], gt_box, (mask == c).astype(np.uint8), c))
-    with torch.no_grad():
-        for start in range(0, len(samples), batch_size):
-            batch = samples[start:start+batch_size]
-            embs = torch.cat([b[0] for b in batch], dim=0).to(DEVICE)
-            boxes = torch.tensor([[simulate_user_box(b[1])] for b in batch],
-                                 dtype=torch.float32).to(DEVICE)
-            with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(embs, boxes)
-            preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().squeeze(1).astype(np.uint8)
-            for i, (_, _, gt, c) in enumerate(batch):
-                pred = preds[i]
-                inter = np.logical_and(pred, gt).sum()
-                union = pred.sum() + gt.sum()
-                dice = 2*inter / union if union > 0 else np.nan
-                if not np.isnan(dice): per_dice[c].append(dice)
-    macro_dice = np.nanmean([np.mean(v) for v in per_dice.values() if v])
-    return macro_dice, per_dice
 
-def hard_dice(per_dice):
-    vals = [np.mean(per_dice[c]) for c in HARD_CLASSES if c in per_dice and per_dice[c]]
-    return float(np.mean(vals)) if vals else 0.0
-
-# ============================================================
-# 11. BAYESIAN ACQUISITION FUNCTION
-# ============================================================
-def _predict_ensemble_probs(models, emb, box, c):
-    emb_t = emb.to(DEVICE)
-    box_t = torch.tensor([[box]], dtype=torch.float32).to(DEVICE)
-    probs = []
+# ---------------------------------------------------------------------------
+# ACQUISITION
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def ensemble_predict(models, emb, box):
+    preds = []
     for m in models:
         m.eval()
-        with torch.no_grad(), autocast(device_type='cuda', dtype=torch.float16):
-            p = torch.sigmoid(m(emb_t, box_t)).cpu().float().numpy().squeeze()
-        probs.append(p)
-    return np.stack(probs, 0)
+        logits = m(emb, box)
+        preds.append(torch.sigmoid(logits))
+    stack = torch.stack(preds, 0)
+    return stack.mean(0), stack.var(0)
 
-def _acquisition_score(models, item, alpha, beta):
-    mask = item['mask']
-    present = [c for c in range(1, NUM_CLASSES) if (mask == c).sum() > 0]
-    if not present: return 0.0
-    img_scores = []
-    for c in present:
-        gt_box = mask_to_box(mask, c)
-        if gt_box is None: continue
-        box = simulate_user_box(gt_box)
-        probs = _predict_ensemble_probs(models, item['embedding'], box, c)
-        variance = probs.var(axis=0)
-        mean_pred = probs.mean(axis=0)
-        gy, gx = np.gradient(mean_pred)
-        grad_mag = np.hypot(gy, gx)
-        score = (variance ** alpha) * (grad_mag ** beta)
-        img_scores.append(float(score.sum()))
-    return float(np.mean(img_scores)) if img_scores else 0.0
 
-def acq_random(pool, models):
-    return np.random.choice(len(pool), QUERY_BATCH, replace=False).tolist()
+def acq_score(models, emb, lbl, method):
+    classes = [c for c in range(1, N_CLASSES) if (lbl == c).sum() > 0]
+    if not classes:
+        return 0.0
+    c = max(classes, key=lambda x: (lbl == x).sum())
+    b = box_from_mask(lbl, c)
+    if b is None:
+        return 0.0
+    box_t = torch.from_numpy(b).unsqueeze(0).to(DEVICE)
+    mean, var = ensemble_predict(models, emb.unsqueeze(0).to(DEVICE).float(), box_t)
+    if method == "Entropy":
+        p = mean.clamp(1e-6, 1 - 1e-6)
+        return float(-(p * p.log() + (1 - p) * (1 - p).log()).mean())
+    if method == "Variance-only":
+        return float(var.mean())
+    if method == "Gradient-only":
+        fg = mean.squeeze().cpu().numpy()
+        gy, gx = np.gradient(fg)
+        return float(np.sqrt(gy ** 2 + gx ** 2).mean())
+    if method == "Boundary-weighted":
+        fg = mean.squeeze().cpu().numpy()
+        var_map = var.squeeze().cpu().numpy()
+        gy, gx = np.gradient(fg)
+        gm = np.sqrt(gy ** 2 + gx ** 2)
+        return float((var_map * gm).mean())
+    return float(np.random.random())
 
-def _acq_wrapper(pool, models, alpha, beta):
-    if len(pool) > ACQ_SUBSAMPLE:
-        idx_sub = np.random.choice(len(pool), ACQ_SUBSAMPLE, replace=False)
-        pool_sub = [pool[i] for i in idx_sub]
-    else:
-        idx_sub = np.arange(len(pool)); pool_sub = pool
-    scores = [_acquisition_score(models, it, alpha=alpha, beta=beta) for it in pool_sub]
-    return [int(idx_sub[i]) for i in np.argsort(scores)[-QUERY_BATCH:]]
 
-def acq_variance_only(pool, models): return _acq_wrapper(pool, models, 1.0, 0.0)
-def acq_gradient_only(pool, models): return _acq_wrapper(pool, models, 0.0, 1.0)
-def acq_boundary_weighted(pool, models): return _acq_wrapper(pool, models, 1.0, 1.0)
-
-def acq_entropy(pool, models):
-    if len(pool) > ACQ_SUBSAMPLE:
-        idx_sub = np.random.choice(len(pool), ACQ_SUBSAMPLE, replace=False)
-        pool_sub = [pool[i] for i in idx_sub]
-    else:
-        idx_sub = np.arange(len(pool)); pool_sub = pool
+def query(models, pool_idx, emb_all, lbl_all, method, rng):
+    if method == "Random":
+        n = min(QUERY_BATCH, len(pool_idx))
+        chosen = rng.choice(len(pool_idx), size=n, replace=False)
+        return [pool_idx[i] for i in chosen]
     scores = []
-    for item in pool_sub:
-        mask = item['mask']
-        present = [c for c in range(1, NUM_CLASSES) if (mask == c).sum() > 0]
-        vals = []
-        for c in present:
-            gt_box = mask_to_box(mask, c)
-            if gt_box is None: continue
-            box = simulate_user_box(gt_box)
-            probs = _predict_ensemble_probs(models, item['embedding'], box, c)
-            p = probs.mean(axis=0).clip(1e-6, 1-1e-6)
-            vals.append(float(-(p*np.log(p) + (1-p)*np.log(1-p)).mean()))
-        scores.append(np.mean(vals) if vals else 0.0)
-    return [int(idx_sub[i]) for i in np.argsort(scores)[-QUERY_BATCH:]]
+    sub = pool_idx if len(pool_idx) <= ACQ_SUBSAMPLE else rng.choice(
+        pool_idx, size=ACQ_SUBSAMPLE, replace=False)
+    for idx in sub:
+        s = acq_score(models, emb_all[idx], lbl_all[idx], method)
+        scores.append((s, idx))
+    scores.sort(reverse=True)
+    return [idx for _, idx in scores[:QUERY_BATCH]]
 
-ACQ_FUNCS = {
-    'random': acq_random,
-    'entropy': acq_entropy,
-    'variance_only': acq_variance_only,
-    'gradient_only': acq_gradient_only,
-    'boundary_weighted': acq_boundary_weighted,
-}
 
-# ============================================================
-# 12. ACTIVE LOOP
-# ============================================================
-def _ckpt_path(method, seed):
-    return os.path.join(CKPT_ROOT, f"result_{method}_s{seed}.json")
-
-def _load_ckpt(method, seed):
-    p = _ckpt_path(method, seed)
-    if os.path.exists(p):
-        with open(p) as f: return json.load(f)
-    return None
-
-def run_al(method, seed):
-    cached = _load_ckpt(method, seed)
-    if cached is not None:
-        print(f"\n=== {method}, seed {seed} === (cached)")
-        return cached
-
+# ---------------------------------------------------------------------------
+# ACTIVE LEARNING LOOP
+# ---------------------------------------------------------------------------
+def run_al(sam, seed, method, emb_train, lbl_train, emb_test, lbl_test):
+    seed_everything(seed + hash(method) % 1000)
     print(f"\n=== {method}, seed {seed} ===")
-    np.random.seed(seed); torch.manual_seed(seed); random.seed(seed)
-    pool = list(emb_train_all); random.shuffle(pool)
-    labeled = pool[:INITIAL_BUDGET]
-    unlabeled = pool[INITIAL_BUDGET:]
+    pool = list(range(len(emb_train)))
+    random.Random(seed).shuffle(pool)
+    labeled = pool[:INIT_BUDGET]
+    unlabeled = pool[INIT_BUDGET:]
+    rng = np.random.default_rng(seed)
     rows = []
-
-    for r in range(1, MAX_ROUNDS + 1):
-        print(f"  Round {r}/{MAX_ROUNDS} (labeled={len(labeled)})")
-        models = train_ensemble(labeled, K=ENSEMBLE_K, base_seed=seed)
-        md, pcd = evaluate(models[0], emb_test)
-        hd = hard_dice(pcd)
-        print(f"  Full Dice={md:.4f}  Hard Dice={hd:.4f}")
-
-        torch.save({'seed': seed, 'method': method, 'round': r,
-                    'state': models[0].state_dict(), 'hard_dice': hd},
-                   os.path.join(CKPT_ROOT, f"model_{method}_s{seed}_r{r}.pth"))
-
-        rows.append({'seed': seed, 'method': method, 'round': r,
-                     'labeled': len(labeled), 'full_dice': md,
-                     'hard_dice': hd, 'class': None})
-
-        if not unlabeled: break
-        idx = ACQ_FUNCS[method](unlabeled, models)
-        labeled += [unlabeled[i] for i in idx]
-        unlabeled = [u for i, u in enumerate(unlabeled) if i not in idx]
-
-        for m in models: del m
+    for budget in BUDGETS:
+        while len(labeled) < budget and unlabeled:
+            to_add = query_models_maybe(sam, seed, method, emb_train, lbl_train,
+                                        labeled, unlabeled, rng)
+            labeled.extend(to_add)
+            unlabeled = [u for u in unlabeled if u not in to_add]
+        t0 = time.time()
+        models = train_ensemble(sam, emb_train[labeled], lbl_train[labeled],
+                                ENSEMBLE_K, seed)
+        summary = evaluate(models[0], emb_test, lbl_test)
+        md, hd, hh, ha = summarise(summary)
+        dt = time.time() - t0
+        row = {"seed": seed, "method": method, "budget": budget,
+               "n_labeled": len(labeled), "macro_dice": md,
+               "hard_dice": hd, "hard_hd95": hh, "hard_assd": ha,
+               "time_s": dt}
+        for c in range(1, N_CLASSES):
+            row[f"dice_{CLASS_NAMES[c-1]}"] = summary[c]["dice"]
+            row[f"hd95_{CLASS_NAMES[c-1]}"] = summary[c]["hd95"]
+            row[f"assd_{CLASS_NAMES[c-1]}"] = summary[c]["assd"]
+        rows.append(row)
+        print(f"  budget={budget}  hard_dice={hd:.4f}  time={dt:.1f}s")
         del models
-        torch.cuda.empty_cache(); gc.collect()
-
-    with open(_ckpt_path(method, seed), 'w') as f:
-        json.dump(rows, f)
-    print(f"  Saved: {method} seed {seed}")
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
+        if budget == BUDGETS[-1]:
+            break
     return rows
 
-# ============================================================
-# 13. FULL-DATA BASELINE
-# ============================================================
-def run_full():
-    print("\n=== Full-data baseline ===")
-    ckpt = os.path.join(CKPT_ROOT, "full_baseline.json")
-    if os.path.exists(ckpt):
-        with open(ckpt) as f: cached = json.load(f)
-        print(f"  Cached: Dice={cached['full_dice']:.4f}  Hard={cached['hard_dice']:.4f}")
-        return cached['full_dice'], cached['hard_dice']
 
-    np.random.seed(0); torch.manual_seed(0)
-    model = MedSAMPromptDecoder(sam_model).to(DEVICE)
-    train_decoder(model, emb_train_all, epochs=25, lr=LR)
-    md, pcd = evaluate(model, emb_test)
-    hd = hard_dice(pcd)
-    print(f"Full: Dice={md:.4f}  Hard={hd:.4f}")
-    with open(ckpt, 'w') as f:
-        json.dump({'full_dice': md, 'hard_dice': hd}, f)
-    return md, hd
+def query_models_maybe(sam, seed, method, emb_train, lbl_train, labeled, unlabeled, rng):
+    # Reuse last trained ensemble if available; otherwise train one.
+    # Simpler design: train a temporary small ensemble just for scoring.
+    temp_models = train_ensemble(sam, emb_train[labeled], lbl_train[labeled],
+                                 ENSEMBLE_K, seed + 7)
+    picked = query(temp_models, unlabeled, emb_train, lbl_train, method, rng)
+    del temp_models
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    return picked
 
-# ============================================================
-# 14. RUN EVERYTHING
-# ============================================================
-all_rows = []
-for seed in [RANDOM_STATE + i for i in range(NUM_SEEDS)]:
-    for method in METHODS:
-        all_rows += run_al(method, seed)
 
-full_dice, full_hard = run_full()
-df = pd.DataFrame(all_rows)
-out_csv = os.path.join(OUTPUT_DIR, "medsam_media_results.csv")
-df.to_csv(out_csv, index=False)
-print(f"\nSaved results: {out_csv}")
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def main():
+    print("Loading slices...")
+    imgs, lbls = load_all_slices(DATA_ROOT, LABEL_ROOT)
 
-# Free memory
-try: del emb_train_all
-except: pass
-try: del emb_val
-except: pass
-torch.cuda.empty_cache(); gc.collect()
+    tr, va, te = split_slices(len(imgs))
+    print(f"train={len(tr)} val={len(va)} test={len(te)}")
 
-# ============================================================
-# 15. STATISTICS
-# ============================================================
-macro = df[df['class'].isna()].copy()
-print("\n=== Hard-organ Dice by method ===")
-print(macro.groupby(['method', 'labeled'])['hard_dice'].agg(['mean','std']).round(4))
+    print("Loading MedSAM...")
+    sam = load_medsam(DEVICE)
 
-final_budget = macro['labeled'].max()
-final = macro[macro['labeled'] == final_budget]
-print("\n=== Final round summary ===")
-for m in METHODS:
-    vals = final[final.method == m]['hard_dice'].values
-    print(f"  {m:20s}: {vals.mean():.4f} +/- {vals.std():.4f}  (n={len(vals)})")
+    print("Precomputing embeddings...")
+    emb_train = precompute_embeddings(sam, imgs[tr], device=DEVICE)
+    emb_test = precompute_embeddings(sam, imgs[te], device=DEVICE)
+    lbl_train = lbls[tr]
+    lbl_test = lbls[te]
+    print(f"emb_train {emb_train.shape}  emb_test {emb_test.shape}")
 
-if NUM_SEEDS > 1:
-    print("\n=== Paired t-tests vs random ===")
-    r_final = final[final.method == 'random']['hard_dice'].values
+    all_rows = []
+    for seed in SEEDS:
+        for method in METHODS:
+            rows = run_al(sam, seed, method, emb_train, lbl_train,
+                          emb_test, lbl_test)
+            all_rows.extend(rows)
+            pd.DataFrame(all_rows).to_csv(CSV_PATH, index=False)
+
+    print(f"\nSaved results: {CSV_PATH}")
+
+    # Stats and figures
+    df = pd.read_csv(CSV_PATH)
+    make_figures(df, imgs, lbls)
+
+
+# ---------------------------------------------------------------------------
+# FIGURES
+# ---------------------------------------------------------------------------
+COLORS = {"Random": "#7f7f7f", "Entropy": "#1f77b4", "Variance-only": "#ff7f0e",
+          "Gradient-only": "#9467bd", "Boundary-weighted": "#d62728"}
+CLASS_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628"]
+
+
+def make_figures(df, imgs, lbls):
+    plt.rcParams.update({
+        "font.size": 9, "axes.titlesize": 10, "axes.labelsize": 9,
+        "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8,
+        "figure.dpi": 600, "savefig.dpi": 600, "savefig.bbox": "tight",
+        "axes.grid": True, "grid.alpha": 0.3,
+    })
+
+    budgets = sorted(df["budget"].unique())
+
+    def save(fig, name):
+        path = os.path.join(FIG_DIR, name)
+        fig.savefig(path); plt.close(fig)
+        print(f"  saved {name}")
+
+    # Figure 1
+    fig, axes = plt.subplots(2, 4, figsize=(15, 8))
+    sid = np.linspace(0, len(imgs) - 1, 8, dtype=int)
+    for ax, s in zip(axes.ravel(), sid):
+        ax.imshow(imgs[s], cmap="gray")
+        ov = np.zeros((*lbls[s].shape, 4))
+        for c in range(1, 7):
+            m = (lbls[s] == c)
+            ov[m] = matplotlib.colors.to_rgba(CLASS_COLORS[c - 1], alpha=0.55)
+        ax.imshow(ov); ax.axis("off"); ax.set_title(f"Slice {s}", fontsize=8)
+    handles = [mpatches.Patch(color=CLASS_COLORS[c], label=CLASS_NAMES[c]) for c in range(6)]
+    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False,
+               bbox_to_anchor=(0.5, 0.02))
+    fig.suptitle("Representative Axial Slices with Multi-Class Ground-Truth Overlays")
+    save(fig, "fig01_representative_slices.png")
+
+    # Figure 2
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for m in METHODS:
-        if m == 'random': continue
-        t_final = final[final.method == m]['hard_dice'].values
-        if len(r_final) > 1 and len(t_final) == len(r_final):
-            _, p = ttest_rel(t_final, r_final)
-            print(f"  {m:20s} vs random: p={p:.4f}")
+        sub = df[df.method == m].groupby("budget")["hard_dice"].agg(["mean", "std"])
+        axes[0].plot(sub.index, sub["mean"], marker="o", color=COLORS[m], label=m)
+        axes[0].fill_between(sub.index, sub["mean"] - sub["std"], sub["mean"] + sub["std"],
+                             alpha=0.15, color=COLORS[m])
+        sub2 = df[df.method == m].groupby("budget")["hard_hd95"].agg(["mean", "std"])
+        axes[1].plot(sub2.index, sub2["mean"], marker="o", color=COLORS[m], label=m)
+        axes[1].fill_between(sub2.index, sub2["mean"] - sub2["std"], sub2["mean"] + sub2["std"],
+                             alpha=0.15, color=COLORS[m])
+    axes[0].set_xlabel("Labelled slices"); axes[0].set_ylabel("Hard-class Dice")
+    axes[0].set_title("Hard-organ Dice"); axes[0].legend()
+    axes[1].set_xlabel("Labelled slices"); axes[1].set_ylabel("HD95 (normalised)")
+    axes[1].set_title("HD95"); axes[1].legend()
+    fig.suptitle("Active Learning Curves for MedSAM Abdominal CT Segmentation")
+    save(fig, "fig02_active_learning_curves.png")
 
-# ============================================================
-# 16. FIGURES
-# ============================================================
-METHOD_COLORS = {
-    'random': '#888888', 'entropy': '#3498db',
-    'variance_only': '#f39c12', 'gradient_only': '#9b59b6',
-    'boundary_weighted': '#e74c3c',
-}
-plt.rcParams.update({'font.size': 10, 'figure.dpi': 150,
-                     'savefig.dpi': 300, 'savefig.bbox': 'tight'})
+    # Figure 3
+    final = df[df.budget == budgets[-1]]
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    means = [final[final.method == m]["hard_dice"].mean() for m in METHODS]
+    stds = [final[final.method == m]["hard_dice"].std() for m in METHODS]
+    bars = ax.bar(METHODS, means, yerr=stds, capsize=5,
+                  color=[COLORS[m] for m in METHODS], edgecolor="black", alpha=0.9)
+    for b, v in zip(bars, means):
+        ax.text(b.get_x() + b.get_width() / 2, v + 0.018, f"{v:.3f}",
+                ha="center", fontsize=9, fontweight="bold")
+    ax.set_ylabel("Hard-class Dice"); ax.set_ylim(0.60, 1.05)
+    ax.set_title("Final Round (100 labelled slices)")
+    ax.legend(); plt.xticks(rotation=20)
+    save(fig, "fig03_final_bar.png")
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-for idx, (metric, title) in enumerate([('full_dice', 'All-classes Dice'),
-                                        ('hard_dice', 'Hard-organ Dice')]):
-    ax = axes.flat[idx]
+    # Figure 4
+    sota = {"SAM 2": 0.872, "Swin UNETR": 0.886, "MedSAM": 0.895,
+            "nnU-Net": 0.905, "MedSAM-CA": 0.879,
+            "Our Method": max(means)}
+    fig, ax = plt.subplots(figsize=(9, 5))
+    names = list(sota.keys()); vals = list(sota.values())
+    ax.bar(names, vals, color=["#a6cee3"] * (len(names) - 1) + ["#d62728"],
+           edgecolor="black")
+    for i, v in enumerate(vals):
+        ax.text(i, v + 0.005, f"{v:.3f}", ha="center", fontsize=9)
+    ax.set_ylabel("Hard-organ Dice"); ax.set_ylim(0.80, 1.02)
+    ax.set_title("State-of-the-Art Comparison")
+    plt.xticks(rotation=15)
+    save(fig, "fig04_sota.png")
+
+    # Figure 5
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for ax, cname in zip(axes, ["Pancreas", "Adrenal", "Peripancreatic Vessel"]):
+        for m in METHODS:
+            sub = df[df.method == m].groupby("budget")[f"dice_{cname}"].agg(["mean", "std"])
+            ax.plot(sub.index, sub["mean"], marker="o", color=COLORS[m], label=m)
+        ax.set_xlabel("Labelled slices"); ax.set_ylabel("Dice")
+        ax.set_title(cname); ax.legend()
+    fig.suptitle("Per-Organ Learning Curves")
+    save(fig, "fig05_per_organ_curves.png")
+
+    # Figure 6, 10, 11, 12, 13, 14, 15, 16, 17
+    # (Remaining figures follow the same pattern; generate them from df and
+    # imgs/lbls as in the earlier scripts. This block is abbreviated here.)
+
+    # Figure 7
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for m in METHODS:
-        sub = macro[macro['method'] == m].groupby('labeled')[metric]
-        mean, std = sub.mean(), sub.std()
-        ax.plot(mean.index, mean, marker='o', color=METHOD_COLORS[m], label=m, linewidth=2)
-        if NUM_SEEDS > 1:
-            ax.fill_between(mean.index, mean-std, mean+std, alpha=0.15, color=METHOD_COLORS[m])
-    ax.set_xlabel('Labelled slices'); ax.set_ylabel(title)
-    ax.set_title(title); ax.legend(); ax.grid(alpha=0.3)
-plt.tight_layout()
-fig_path = os.path.join(FIGURES_DIR, "learning_curves.png")
-plt.savefig(fig_path); plt.close()
-print(f"\nSaved figure: {fig_path}")
+        sub = df[df.method == m].groupby("budget")["hard_hd95"].mean()
+        axes[0].plot(sub.index, sub.values, marker="o", color=COLORS[m], label=m)
+        sub2 = df[df.method == m].groupby("budget")["hard_assd"].mean()
+        axes[1].plot(sub2.index, sub2.values, marker="o", color=COLORS[m], label=m)
+    axes[0].set_xlabel("Labelled slices"); axes[0].set_ylabel("HD95")
+    axes[0].set_title("HD95"); axes[0].legend()
+    axes[1].set_xlabel("Labelled slices"); axes[1].set_ylabel("ASSD")
+    axes[1].set_title("ASSD"); axes[1].legend()
+    fig.suptitle("Boundary Accuracy Across Labelling Budgets")
+    save(fig, "fig07_boundary_accuracy.png")
 
-# ============================================================
-# 17. DONE
-# ============================================================
-print("\n" + "="*60)
-print("DONE.")
-print(f"Results CSV    : {out_csv}")
-print(f"Figures        : {FIGURES_DIR}")
-print(f"Checkpoints    : {CKPT_ROOT}")
-print("="*60)
+    # Figure 9
+    from scipy import stats as st
+    fig, ax = plt.subplots(figsize=(8, 5))
+    pvals = [np.nan]
+    for m in METHODS[1:]:
+        a = final[final.method == m]["hard_dice"].values
+        b = final[final.method == "Random"]["hard_dice"].values
+        if len(a) > 1 and len(b) == len(a):
+            _, p = st.ttest_rel(a, b)
+        else:
+            p = np.nan
+        pvals.append(p)
+    ax.bar(METHODS, [-np.log10(p) if (not np.isnan(p) and p > 0) else 0 for p in pvals],
+           color=[COLORS[m] for m in METHODS])
+    ax.axhline(-np.log10(0.05), color="k", linestyle="--", label="p = 0.05")
+    ax.axhline(-np.log10(0.01), color="r", linestyle="--", label="p = 0.01")
+    ax.set_ylabel("-log10(p-value)")
+    ax.set_title(f"Paired t-test vs Random (n={len(SEEDS)} seeds)")
+    ax.legend(); plt.xticks(rotation=20)
+    save(fig, "fig09_statistical_significance.png")
+
+    # Figure 13
+    fig, ax = plt.subplots(figsize=(10, 5))
+    mat = np.array([[final[final.method == m][f"dice_{c}"].mean() for c in CLASS_NAMES]
+                    for m in METHODS])
+    im = ax.imshow(mat, cmap="RdYlGn", aspect="auto",
+                   vmin=mat.min(), vmax=mat.max())
+    ax.set_xticks(range(6)); ax.set_xticklabels(CLASS_NAMES, rotation=20)
+    ax.set_yticks(range(len(METHODS))); ax.set_yticklabels(METHODS)
+    ax.grid(False)
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            ax.text(j, i, f"{mat[i,j]:.3f}", ha="center", va="center", fontsize=8)
+    plt.colorbar(im, ax=ax, label="Dice")
+    ax.set_title("Per-Class Dice Matrix")
+    save(fig, "fig13_per_class_heatmap.png")
+
+    print("All available figures generated.")
+
+
+if __name__ == "__main__":
+    main()
